@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WASM JSON 编码器</title>
+<style>
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: #f5f7fa;
+    color: #333;
+    padding: 30px;
+    max-width: 800px;
+    margin: 0 auto;
+  }
+  h2 {
+    color: #4a90e2;
+    margin-bottom: 20px;
+  }
+  textarea, button, input[type="text"] {
+    width: 100%;
+    padding: 10px;
+    font-size: 1rem;
+    border-radius: 6px;
+    margin-top: 10px;
+  }
+  textarea {
+    border: 1.8px solid #ccc;
+    resize: vertical;
+    min-height: 200px;
+    font-family: monospace;
+  }
+  button {
+    background-color: #4a90e2;
+    color: white;
+    border: none;
+    cursor: pointer;
+    margin-top: 20px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+  }
+  button:hover {
+    background-color: #357ABD;
+  }
+  pre {
+    background: #222;
+    color: #eee;
+    padding: 15px;
+    border-radius: 8px;
+    margin-top: 20px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: monospace;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  label.switch {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 20px;
+    font-weight: bold;
+  }
+  input[type="checkbox"] {
+    width: 20px;
+    height: 20px;
+  }
+</style>
+</head>
+<body>
+
+<h2>JSON 编码器 (WASM)</h2>
+
+<label for="jsonInput">JSON 数据输入:</label>
+<textarea id="jsonInput" aria-label="JSON 输入">{
+  "message_type": "group",
+  "peer_id": 123,
+  "message": [
+    {"type": "text", "data": {"text": "你好世界"}},
+    {"type": "keyboard", "data": {"rows": [
+      {"buttons": [
+        {"id": "1", "render_data": {"label": "⬅️上一页", "visited_label": "⬅️上一页", "style": 1},
+         "action": {"type": 2, "permission": {"type": 2, "specify_role_ids": [], "specify_user_ids": []},
+         "unsupport_tips": "兼容文本", "data": "data", "reply": true, "enter": true}}
+      ]}
+    ]}}
+  ],
+  "seq": 12345678,
+  "random_number": 123456789
+}</textarea>
+
+<label class="switch">
+  <input type="checkbox" id="autoFillSwitch">
+  启用自动填充 seq 和 random_number
+</label>
+
+<label for="serverUrl">服务器地址:</label>
+<input type="text" id="serverUrl" autocomplete="off"
+       placeholder="http://127.0.0.1:3000/send_pb"
+       value="http://127.0.0.1:3000/send_pb" />
+
+<button id="runBtn">生成 HEX</button>
+<button id="copyBtn">复制 HEX</button>
+<button id="sendBtn">发送到服务器</button>
+
+<h3>结果输出:</h3>
+<pre id="resultOutput" aria-live="polite"></pre>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  let wasmInstance = null;
+  let memory = null;
+  let malloc = null;
+  let free = null;
+  let encodeFunc = null;
+
+  function writeStringToMemory(str) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(str + '\0');
+    const ptr = malloc(data.length);
+    const mem = new Uint8Array(memory.buffer, ptr, data.length);
+    mem.set(data);
+    return ptr;
+  }
+
+  function readCString(ptr) {
+    const mem = new Uint8Array(memory.buffer);
+    let end = ptr;
+    while (mem[end] !== 0) end++;
+    return new TextDecoder().decode(mem.slice(ptr, end));
+  }
+
+  function fillRandomFields(obj) {
+    obj.seq = Math.floor(Math.random() * 0xffffffff);
+    obj.random_number = Math.floor(Math.random() * 0xffffffff);
+    return obj;
+  }
+
+  async function initWasm(base64Wasm) {
+    if (wasmInstance) return wasmInstance;
+
+    let bytes;
+    if (base64Wasm) {
+      const binaryString = atob(base64Wasm);
+      bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+    } else {
+      const response = await fetch('wasm_project.wasm');
+      const buffer = await response.arrayBuffer();
+      bytes = new Uint8Array(buffer);
+    }
+
+    const { instance } = await WebAssembly.instantiate(bytes.buffer, {});
+    wasmInstance = instance;
+    memory = wasmInstance.exports.memory;
+    malloc = wasmInstance.exports.malloc;
+    free = wasmInstance.exports.free_ptr;
+    encodeFunc = wasmInstance.exports.encode_from_json;
+    return wasmInstance;
+  }
+
+  async function encodeJson(obj) {
+    await initWasm("{wasm_file_base64}");
+    const jsonStr = JSON.stringify(obj);
+    const ptr = writeStringToMemory(jsonStr);
+    const resultPtr = encodeFunc(ptr);
+
+    if (!resultPtr) {
+      free(ptr);
+      throw new Error("encode_from_json 返回空指针");
+    }
+
+    const hex = readCString(resultPtr);
+    free(ptr);
+    free(resultPtr);
+    return hex;
+  }
+
+  async function generateHex() {
+    let inputJson = document.getElementById("jsonInput").value.trim();
+    let jsonObj;
+    try {
+      jsonObj = JSON.parse(inputJson);
+    } catch (e) {
+      alert("输入的 JSON 格式不正确。");
+      return;
+    }
+
+    if (document.getElementById("autoFillSwitch").checked) {
+      jsonObj = fillRandomFields(jsonObj);
+      document.getElementById("jsonInput").value = JSON.stringify(jsonObj, null, 2);
+    }
+
+    try {
+      const hex = await encodeJson(jsonObj);
+      document.getElementById("resultOutput").textContent = hex;
+    } catch (err) {
+      alert("编码失败: " + err.message);
+    }
+  }
+
+  async function sendToServer() {
+    const hex = document.getElementById("resultOutput").textContent;
+    const serverUrl = document.getElementById("serverUrl").value.trim();
+    if (!hex) return alert("请先生成 HEX");
+
+    try {
+      const response = await fetch(serverUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cmd: "MessageSvc.PbSendMsg", hex })
+      });
+      const result = await response.text();
+      alert("发送成功，服务器返回:\n" + result);
+    } catch (err) {
+      alert("发送失败: " + err.message);
+    }
+  }
+
+  function copyHex() {
+    const hex = document.getElementById("resultOutput").textContent;
+    if (!hex) return alert("没有可复制的内容。");
+    navigator.clipboard.writeText(hex).then(() => alert("已复制到剪贴板。"));
+  }
+
+  document.getElementById("runBtn").addEventListener("click", generateHex);
+  document.getElementById("copyBtn").addEventListener("click", copyHex);
+  document.getElementById("sendBtn").addEventListener("click", sendToServer);
+});
+</script>
+</body>
+</html>
